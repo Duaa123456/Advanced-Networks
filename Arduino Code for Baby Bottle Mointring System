@@ -1,0 +1,154 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <MPU6050.h>
+
+// Sensor setup
+#define ONE_WIRE_BUS 2      // Pin for the temperature sensor
+#define RED_LED_PIN 3       // Pin for the red LED
+#define GREEN_LED_PIN 4     // Pin for the green LED
+#define BUZZER_PIN 1        // Pin for the buzzer
+
+// OneWire library setup
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// Safe temperature (less than 32°C)
+const float SAFE_TEMP_C = 32.0;
+
+// MPU6050 setup
+MPU6050 mpu;
+// Acceleration and gyroscope thresholds based on the most accurate code
+const int DRINK_POSITION_AZ = 10000;    // Tilt threshold for drinking
+const int ACC_THRESHOLD_THROW = 20000;  // Acceleration threshold for throwing the bottle
+const int GYRO_THRESHOLD_THROW = 400;   // Gyroscope threshold for throwing the bottle
+
+// Acceleration limits for X, Y, and Z axes for standing
+const int STAND_ACC_AX_MIN = 11000;
+const int STAND_ACC_AX_MAX = 11700;
+const int STAND_ACC_AY_MIN = -300;
+const int STAND_ACC_AY_MAX = 300;
+const int STAND_ACC_AZ_MIN = 9800;
+const int STAND_ACC_AZ_MAX = 10200;
+const int STAND_GYRO_THRESHOLD = 250;
+
+// Function to send an alert via SNS (through Bluetooth to a Raspberry Pi)
+void sendSNSAlert() {
+  Serial1.println("{\"bottle_thrown\": true}");
+  Serial.println("SNS Alert Sent: Bottle thrown notification");
+}
+
+void setup() {
+  Serial.begin(9600);        // Serial monitor
+  Serial1.begin(9600);       // Bluetooth communication via Serial1
+
+  // Initialize DS18B20 temperature sensor
+  sensors.begin();
+
+  // Initialize LED and buzzer pins
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Initialize MPU6050
+  Wire.begin();
+  mpu.initialize();
+
+  if (mpu.testConnection()) {
+    Serial.println("MPU6050 connected successfully.");
+    Serial1.println("MPU6050 connected successfully."); // Send via Bluetooth using Serial1
+  } else {
+    Serial.println("MPU6050 connection failed.");
+    Serial1.println("MPU6050 connection failed."); // Send via Bluetooth using Serial1
+  }
+
+  // Turn off the LEDs and buzzer initially
+  digitalWrite(RED_LED_PIN, LOW);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+void loop() {
+  // ----------- Handling DS18B20 (temperature) -----------
+  sensors.requestTemperatures();
+  float temperatureC = sensors.getTempCByIndex(0);
+
+  if (temperatureC == DEVICE_DISCONNECTED_C) {
+    Serial.println("Error: Could not read temperature data.");
+    Serial1.println("Error: Could not read temperature data.");
+  } else {
+    Serial.print("Temperature: ");
+    Serial.print(temperatureC);
+    Serial.println(" °C");
+
+    Serial1.print("Temperature: ");
+    Serial1.print(temperatureC);
+    Serial1.println(" °C");
+
+    if (temperatureC < SAFE_TEMP_C) {
+      Serial.println("Temperature is safe.");
+      Serial1.println("Temperature is safe.");
+      digitalWrite(GREEN_LED_PIN, HIGH);
+      digitalWrite(RED_LED_PIN, LOW);
+    } else {
+      Serial.println("Temperature is not safe.");
+      Serial1.println("Temperature is not safe.");
+      digitalWrite(RED_LED_PIN, HIGH);
+      digitalWrite(GREEN_LED_PIN, LOW);
+    }
+  }
+
+  // ----------- Handling MPU6050 (most accurate code) -----------
+  int16_t ax, ay, az;
+  int16_t gx, gy, gz;
+
+  mpu.getAcceleration(&ax, &ay, &az);
+  mpu.getRotation(&gx, &gy, &gz);
+
+  // Print values to Serial and Bluetooth
+  Serial.print("aX = "); Serial.print(ax);
+  Serial.print(" | aY = "); Serial.print(ay);
+  Serial.print(" | aZ = "); Serial.println(az);
+
+  Serial.print("gX = "); Serial.print(gx);
+  Serial.print(" | gY = "); Serial.print(gy);
+  Serial.print(" | gZ = "); Serial.println(gz);
+
+  Serial1.print("aX = "); Serial1.print(ax);
+  Serial1.print(" | aY = "); Serial1.print(ay);
+  Serial1.print(" | aZ = "); Serial1.println(az);
+
+  Serial1.print("gX = "); Serial1.print(gx);
+  Serial1.print(" | gY = "); Serial1.print(gy);
+  Serial1.print(" | gZ = "); Serial1.println(gz);
+
+  // Check if the baby is drinking from the bottle
+  if (az > DRINK_POSITION_AZ && abs(ax) < ACC_THRESHOLD_THROW && abs(ay) < ACC_THRESHOLD_THROW) {
+    Serial.println("Baby is drinking the bottle.");
+    Serial1.println("Baby is drinking the bottle.");
+    digitalWrite(BUZZER_PIN, LOW);  // Turn off buzzer when drinking
+  }
+  // Check if the bottle is standing still
+  else if (ax >= STAND_ACC_AX_MIN && ax <= STAND_ACC_AX_MAX && 
+           ay >= STAND_ACC_AY_MIN && ay <= STAND_ACC_AY_MAX && 
+           az >= STAND_ACC_AZ_MIN && az <= STAND_ACC_AZ_MAX && 
+           abs(gx) < STAND_GYRO_THRESHOLD && abs(gy) < STAND_GYRO_THRESHOLD && abs(gz) < STAND_GYRO_THRESHOLD) {
+    Serial.println("The bottle is standing still.");
+    Serial1.println("The bottle is standing still.");
+    digitalWrite(BUZZER_PIN, LOW);  // Turn off buzzer when standing
+  }
+  // Check if the bottle has been thrown
+  else if (abs(ax) > ACC_THRESHOLD_THROW || abs(ay) > ACC_THRESHOLD_THROW || abs(az) > ACC_THRESHOLD_THROW ||
+           abs(gx) > GYRO_THRESHOLD_THROW || abs(gy) > GYRO_THRESHOLD_THROW || abs(gz) > GYRO_THRESHOLD_THROW) {
+    Serial.println("The bottle is thrown.");
+    Serial1.println("The bottle is thrown.");
+    digitalWrite(BUZZER_PIN, HIGH);  // Turn on buzzer when bottle is thrown
+    sendSNSAlert(); // Call the SNS alert function
+  } else {
+    Serial.println("The bottle is in an unknown state.");
+    Serial1.println("The bottle is in an unknown state.");
+    digitalWrite(BUZZER_PIN, LOW);  // Turn off buzzer for unknown state
+  }
+
+  delay(500);  // Delay 0.5 seconds between each reading
+}
