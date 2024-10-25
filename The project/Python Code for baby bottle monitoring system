@@ -1,0 +1,174 @@
+import paho.mqtt.client as mqtt
+import serial
+import ssl
+import time
+import json
+import boto3  # Import the boto3 library for SNS
+
+# Initialize MQTT Client
+mqtt_client = mqtt.Client()
+
+# Configure TLS/SSL settings for AWS IoT
+mqtt_client.tls_set(ca_certs="/home/pi/AmazonRootCA1.pem",  # Path to the Amazon Root CA certificate
+                    certfile="/home/pi/certificate.pem.crt",  # Path to device certificate
+                    keyfile="/home/pi/private.pem.key",  # Path to private key
+                    tls_version=ssl.PROTOCOL_TLSv1_2)  # Ensure TLSv1.2 is used for security
+mqtt_client.tls_insecure_set(False)
+
+# Initialize SNS Client (AWS Simple Notification Service) for sending alerts
+sns_client = boto3.client('sns', region_name='ap-southeast-2')  # Specify the AWS region
+
+# SNS Topic ARN (replace with your actual SNS Topic ARN)
+SNS_TOPIC_ARN = "arn:aws:sns:ap-southeast-2:354918365179:BabyBottleAlerts"
+
+# Cooldown period (in seconds) between alerts to prevent excessive notifications
+COOLDOWN_PERIOD = 60  # 1 minutes
+last_alert_time = 0  # Track the last time an alert was sent
+
+# Reconnect logic if disconnected from AWS IoT
+def on_disconnect(client, userdata, rc):
+    """
+    Callback function that handles reconnection to AWS IoT if the client is disconnected.
+    """
+    print("Disconnected from AWS IoT Core. Reconnecting...")
+    mqtt_client.reconnect()
+
+# Assign the disconnect callback function to the MQTT client
+mqtt_client.on_disconnect = on_disconnect
+
+# Connect to AWS IoT endpoint
+def connect_to_aws():
+    """
+    Connects the MQTT client to the AWS IoT Core endpoint using TLS on port 8883.
+    """
+    mqtt_client.connect("ahynb5w3d150p-ats.iot.ap-southeast-2.amazonaws.com", 8883, 120)
+
+# Read sensor data from the Bluetooth serial port
+def read_sensor_data():
+    """
+    Reads data from the Bluetooth serial port (/dev/rfcomm0) and parses it to capture
+    temperature, accelerometer, and gyroscope data. Also detects the status of the bottle (e.g., thrown or drinking).
+    Returns the collected data as a dictionary.
+    """
+    try:
+        # Open the serial port (ensure baud rate matches with the connected device)
+        ser = serial.Serial('/dev/rfcomm0', baudrate=9600, timeout=1)
+
+        # Dictionary to store collected sensor data
+        data = {}
+        temperature_value = None
+        temperature_status = None
+
+        while True:
+            line = ser.readline().decode('utf-8').strip()
+            print(f"Received line: {line}")  # Debug: print each line received
+
+            # Capture temperature value
+            if line.startswith("Temperature:"):
+                temperature_value = line.split(":")[1].strip()
+                data["temperature_value"] = temperature_value  # Store temperature value
+            elif "Temperature is" in line:
+                temperature_status = line  # Capture temperature status (e.g., safe or not)
+
+            # Capture accelerometer and gyroscope data
+            elif line.startswith("aX"):
+                data["accelerometer"] = line  # Capture accelerometer data
+            elif line.startswith("gX"):
+                data["gyroscope"] = line  # Capture gyroscope data
+            elif line.startswith("Baby is drinking the bottle."):
+                data["status"] = line  # Capture the baby bottle status
+            elif line.startswith("The bottle is thrown."):
+                data["status"] = line  # Capture the thrown status
+
+            # Modify condition: Allow missing temperature values, but proceed with other data
+            if ("accelerometer" in data and "gyroscope" in data) or "status" in data:
+                if temperature_value is None:
+                    print("Temperature data missing, proceeding with other data.")
+                data["temperature_status"] = temperature_status or "Unknown"
+                break
+
+        print(f"Final data: {data}")  # Debug: Show the complete data set
+        return data if data else None
+
+    except Exception as e:
+        print(f"Error reading from serial: {e}")
+        return None
+
+# Send an SNS alert with a cooldown check to prevent frequent alerts
+def send_sns_alert(message):
+    """
+    Sends an SNS alert with the given message if the cooldown period has passed since the last alert.
+    """
+    global last_alert_time
+    current_time = time.time()
+
+    # Check if the cooldown period has passed
+    if current_time - last_alert_time >= COOLDOWN_PERIOD:
+        try:
+            response = sns_client.publish(
+                TopicArn=SNS_TOPIC_ARN,
+                Subject='Baby Bottle Alert',
+                Message=message
+            )
+            print("SNS Alert Sent Successfully!")
+            last_alert_time = current_time  # Update the last alert time
+        except Exception as e:
+            print(f"Error sending SNS alert: {e}")
+    else:
+        print("Cooldown period active. No alert sent.")
+
+# Publish sensor data to AWS IoT
+def publish_sensor_data():
+    """
+    Reads sensor data and publishes it to AWS IoT Core as an MQTT message.
+    Checks if the bottle is thrown by evaluating sensor values, and sends an SNS alert if necessary.
+    """
+    sensor_data = read_sensor_data()
+    if sensor_data:
+        # Add a timestamp to the data for tracking and partitioning in databases like DynamoDB
+        sensor_data["timestamp"] = int(time.time())  # Current UNIX timestamp
+
+        # Format the payload as a JSON string for MQTT publishing
+        payload = json.dumps(sensor_data)
+
+        # Try publishing to AWS IoT
+        try:
+            result = mqtt_client.publish("baby_monitoring/sensor_data", payload)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                print(f"Failed to publish: {result.rc}")
+            else:
+                print(f"Successfully published: {payload}")
+
+            # Check if the bottle has been thrown and send an SNS alert
+            if ("accelerometer" in sensor_data and "gyroscope" in sensor_data):
+                # Parse the accelerometer and gyroscope values
+                acc_values = [int(v.split('=')[1].strip()) for v in sensor_data["accelerometer"].split('|')]
+                gyro_values = [int(v.split('=')[1].strip()) for v in sensor_data["gyroscope"].split('|')]
+
+                # Debug: Print parsed values
+                print(f"Parsed accelerometer values: {acc_values}")
+                print(f"Parsed gyroscope values: {gyro_values}")
+
+                # Threshold values to determine if the bottle is thrown
+                if abs(acc_values[0]) > 15000 or abs(acc_values[1]) > 15000 or abs(acc_values[2]) > 15000 or \
+                   abs(gyro_values[0]) > 500 or abs(gyro_values[1]) > 500 or abs(gyro_values[2]) > 500:
+                    send_sns_alert("The baby bottle has been thrown. Please check immediately!")
+
+        except Exception as e:
+            print(f"Error while publishing to AWS IoT: {e}")
+
+# Main loop that continuously reads and publishes sensor data
+def main():
+    """
+    Main function to connect to AWS IoT and repeatedly publish sensor data every 5 seconds.
+    """
+    connect_to_aws()  # Connect to AWS IoT
+    mqtt_client.loop_start()  # Start the network loop for MQTT communication
+
+    while True:
+        publish_sensor_data()  # Publish data
+        time.sleep(5)  # Delay between each publish
+
+# Entry point of the script
+if __name__ == "__main__":
+    main()
