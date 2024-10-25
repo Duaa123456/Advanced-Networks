@@ -10,8 +10,8 @@ mqtt_client = mqtt.Client()
 
 # Configure TLS/SSL settings for AWS IoT
 mqtt_client.tls_set(ca_certs="/home/pi/AmazonRootCA1.pem",  # Path to the Amazon Root CA certificate
-                    certfile="/home/pi/certificate.pem.crt",  # Path to your device certificate
-                    keyfile="/home/pi/private.pem.key",  # Path to your private key
+                    certfile="/home/pi/certificate.pem.crt",  # Path to device certificate
+                    keyfile="/home/pi/private.pem.key",  # Path to private key
                     tls_version=ssl.PROTOCOL_TLSv1_2)  # Ensure TLSv1.2 is used for security
 mqtt_client.tls_insecure_set(False)
 
